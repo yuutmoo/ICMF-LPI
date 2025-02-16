@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 import dgl
+import dhg
 import scipy
 from dgl.nn.pytorch import GraphConv, GATConv
 
-from GCNLayer import *
+
+from Layer import *
 from utils import *
 
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -37,9 +39,11 @@ class HANLayer(nn.Module):
 
         super(HANLayer, self).__init__()
         self.gat_layer1 = GraphConv(in_size, out_size, activation=F.relu, allow_zero_in_degree=True).apply(init)
+        # self.gat_layer2 = GraphConv(out_size, out_size, activation=F.relu, allow_zero_in_degree=True).apply(init)
         self.semantic_attention = SemanticAttention(in_size=out_size * layer_num_heads)
         self.meta_paths = list(meta_path for meta_path in meta_paths)
         self._cached_graph = None
+        self.dropout = dropout
         self._cached_coalesced_graph = {}
 
     def forward(self, g, h):
@@ -53,7 +57,7 @@ class HANLayer(nn.Module):
         for i, meta_path in enumerate(self.meta_paths):
             new_g = self._cached_coalesced_graph[tuple(meta_path)]
             embedding = self.gat_layer1(new_g, h)
-            embedding = F.dropout(embedding, inplace=False, p=0.2)
+            embedding = F.dropout(embedding, inplace=False, p=self.dropout)
             semantic_embeddings.append(embedding.flatten(1))
 
         semantic_embeddings = torch.stack(semantic_embeddings, dim=1)
@@ -118,8 +122,8 @@ class MultiHeadAttentionAggregator(nn.Module):
         self.k_linear_p = nn.Linear(hidden_dim, hidden_dim)
         self.v_linear_p = nn.Linear(hidden_dim, hidden_dim)
 
-        self.ln1 = nn.LayerNorm(hidden_dim * 2)
-        self.ln2 = nn.LayerNorm(hidden_dim * 2)
+        self.ln1 = nn.LayerNorm(lncRNA_dim // 2)
+        self.ln2 = nn.LayerNorm(protein_dim // 2)
 
         self.mlp_lncRNA = nn.Sequential(
             nn.Linear(hidden_dim * 2, lncRNA_dim // 2),
@@ -164,6 +168,7 @@ class MultiHeadAttentionAggregator(nn.Module):
             protein_miRNA_matrix.unsqueeze(0).expand(self.num_heads, -1, -1) == 0, -1e9)
         attention_weights_protein = F.softmax(attention_scores_protein, dim=-1)
 
+
         context_lncRNA = torch.matmul(attention_weights_lncRNA, V_lncRNA).transpose(0, 1).contiguous().view(num_lncRNA,
                                                                                                             self.hidden_dim)
         context_lncRNA = torch.relu(context_lncRNA)
@@ -183,29 +188,42 @@ class MultiHeadAttentionAggregator(nn.Module):
         final_context_lncRNA = torch.cat((lncRNA_transformed, final_context_lncRNA), dim=-1)
         final_context_protein = torch.cat((final_context_protein, protein_transformed), dim=-1)
 
-        final_context_lncRNA = self.ln1(final_context_lncRNA)
-        final_context_protein = self.ln2(final_context_protein)
 
         # MLP for final output
         output_embedding_lncRNA = self.mlp_lncRNA(final_context_lncRNA)
         output_embedding_protein = self.mlp_protein(final_context_protein)
+        output_embedding_lncRNA = self.ln1(output_embedding_lncRNA)
+        output_embedding_protein = self.ln2(output_embedding_protein)
         return output_embedding_lncRNA, output_embedding_protein
 
 
 class ICMFLPI(nn.Module):
     def __init__(self, all_meta_paths, in_size, hidden_size, out_size, dropout, mask_rna, mask_pro, mask_mi, rna_mi,
-                 pro_mi):
+                 pro_mi,l_hpGraph,p_hpGraph):
         super(ICMFLPI, self).__init__()
         self.mask_rna = mask_rna
         self.mask_pro = mask_pro
         self.rna_mi = rna_mi
         self.pro_mi = pro_mi
         self.mask_mi = mask_mi
+
+        self.l_hpGraph = l_hpGraph
+        self.p_hpGraph = p_hpGraph
+        self.l_hpNet = HGNNPConv(out_size, 32,drop_rate=0.1).to("cuda:0")
+        self.p_hpNet = HGNNPConv(out_size, 32,drop_rate=0.1).to("cuda:0")
+
+
         self.L_HAN = HAN(all_meta_paths[0], in_size[0], hidden_size, out_size, dropout)
         self.P_HAN = HAN(all_meta_paths[1], in_size[1], hidden_size, out_size, dropout)
         self.M_HAN = HAN(all_meta_paths[2], in_size[2], hidden_size, out_size, dropout)
+
         self.local_projector = nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.PReLU(),
                                              nn.Linear(hidden_size, hidden_size))
+        self.rna_attention = nn.Linear(hidden_size, 1)
+        self.protein_attention = nn.Linear(hidden_size, 1)
+        self.miRNA_attention = nn.Linear(hidden_size, 1)
+
+
         self.MLP = MLP(out_size)
         self.attentionAggregator = MultiHeadAttentionAggregator(out_size, out_size, out_size, 32, 2)
         self.weight = nn.Parameter(torch.Tensor(hidden_size, hidden_size), requires_grad=True)
@@ -236,22 +254,27 @@ class ICMFLPI(nn.Module):
         )
         return loss.mean()
 
+
     def metapath_contrast(self, rna_embs, protein_embs, miRNA_embs):
         rna_contrastive_losses = []
         pro_contrastive_losses = []
         mi_contrastive_losses = []
+
         for i in range(rna_embs.shape[1]):
             for j in range(i, rna_embs.shape[1]):
-                rna_contrastive_losses.append(
-                    self.contrast(rna_embs[:, i], rna_embs[:, j], self.mask_rna))
+                loss = self.contrast(rna_embs[:, i], rna_embs[:, j], self.mask_rna)
+                rna_contrastive_losses.append(loss)
+
         for i in range(protein_embs.shape[1]):
             for j in range(i, protein_embs.shape[1]):
-                pro_contrastive_losses.append(
-                    self.contrast(protein_embs[:, i], protein_embs[:, j], self.mask_pro))
+                loss = self.contrast(protein_embs[:, i], protein_embs[:, j], self.mask_pro)
+                pro_contrastive_losses.append(loss)
+
         for i in range(miRNA_embs.shape[1]):
             for j in range(i, miRNA_embs.shape[1]):
-                mi_contrastive_losses.append(
-                    self.contrast(miRNA_embs[:, i], miRNA_embs[:, j], self.mask_mi))
+                loss = self.contrast(miRNA_embs[:, i], miRNA_embs[:, j], self.mask_mi)
+                mi_contrastive_losses.append(loss)
+
 
         rna_contrastive_losses = sum(rna_contrastive_losses) / len(rna_contrastive_losses)
         pro_contrastive_losses = sum(pro_contrastive_losses) / len(pro_contrastive_losses)
@@ -272,41 +295,36 @@ class ICMFLPI(nn.Module):
         loss = self.infonce(h1, h2, mask)
         return loss
 
-    def forward(self, graph, h, dateset_index, data, iftrain=True, lncRNA_h=None, protein_h=None, miRNA_h=None,
-                rna_embs=None,
-                protein_embs=None, miRNA_embs=None):
-        if iftrain:
-            lncRNA_h, rna_embs = self.L_HAN(graph[0], h[0])
-            protein_h, protein_embs = self.P_HAN(graph[1], h[1])
-            miRNA_h, miRNA_embs = self.M_HAN(graph[2], h[2])
+    def forward(self, graph, h, dateset_index, data):
+
+        lncRNA_h, rna_embs = self.L_HAN(graph[0], h[0])
+        protein_h, protein_embs = self.P_HAN(graph[1], h[1])
+        miRNA_h, miRNA_embs = self.M_HAN(graph[2], h[2])
 
         rna_contrastive_losses, pro_contrastive_losses, mi_contrastive_losses = self.metapath_contrast(rna_embs,
                                                                                                        protein_embs,
                                                                                                        miRNA_embs)
 
+
         lncRNA_mi_h, protein_mi_h = self.attentionAggregator(lncRNA_h, miRNA_h, protein_h, self.rna_mi, self.pro_mi)
-        # #
+
+        lncRNA_hyper = self.l_hpNet(lncRNA_h,self.l_hpGraph)
+        protein_hyper = self.p_hpNet(protein_h,self.p_hpGraph)
+        a = 0.6
+        lncRNA_mi_h = lncRNA_mi_h*a + lncRNA_hyper * (1-a)
+        protein_mi_h = protein_mi_h*a + protein_hyper * (1-a)
+
         feature = torch.cat((lncRNA_mi_h[data[:, :1]], protein_mi_h[data[:, 1:2]]), dim=2).squeeze(1)
-        # feature = torch.cat((lncRNA_h[data2[:, :1]], protein_h[data2[:, 1:2]]), dim=2).squeeze(1)
+        # feature = torch.cat((lncRNA_h[data[:, :1]], protein_h[data[:, 1:2]]), dim=2).squeeze(1)
         pred1 = self.MLP(feature[dateset_index])
 
-        if iftrain:
-            return pred1, rna_contrastive_losses, pro_contrastive_losses, mi_contrastive_losses, lncRNA_h, protein_h, miRNA_h, rna_embs, protein_embs, miRNA_embs
-        return pred1
 
+        return pred1, rna_contrastive_losses, pro_contrastive_losses, mi_contrastive_losses, lncRNA_h, protein_h, miRNA_h, rna_embs, protein_embs, miRNA_embs
 
-def contrastive_loss(z1, z2, mask, tau=0.5):
-    z1_norm = torch.norm(z1, dim=-1, keepdim=True)
-    z2_norm = torch.norm(z2, dim=-1, keepdim=True)
-
-    sim = torch.mm(z1, z2.t()) / (torch.mm(z1_norm, z2_norm.t()) + 1e-8)
-    sim = torch.exp(sim / tau)
-
-    sim = sim * mask.float()
-
-    return -torch.log(sim.diag() / sim.sum(dim=1)).mean()
 
 
 def init(i):
     if isinstance(i, nn.Linear):
         torch.nn.init.xavier_uniform_(i.weight)
+
+

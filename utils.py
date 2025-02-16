@@ -1,3 +1,5 @@
+import csv
+import os
 from collections import defaultdict
 
 import dgl
@@ -40,6 +42,7 @@ def create_heterograph(network_path,lncRNA_protein_interaction_matrix,lncRNA_miR
     miRNA_GK_similarity_matrix = np.loadtxt(network_path + 'miRNA_GK_similarity_matrix.txt')
 
     protein_GO_similarity_matrix = np.loadtxt(network_path + 'proteinGO.txt')
+    protein_GK_similarity_matrix = np.loadtxt(network_path + 'protein_GK_similarity_matrix.txt')
 
     protein_miRNA = protein_miRNA_interaction_matrix
     miRNA_protein = protein_miRNA.T
@@ -55,14 +58,13 @@ def create_heterograph(network_path,lncRNA_protein_interaction_matrix,lncRNA_miR
 
 
     protein_go = dgl.from_scipy(sparse.csr_matrix(neighborhood(protein_GO_similarity_matrix, 10)))
+    protein_gk = dgl.from_scipy(sparse.csr_matrix(neighborhood(protein_GK_similarity_matrix, 10)))
 
     miRNA_gk = dgl.from_scipy(sparse.csr_matrix(neighborhood(miRNA_GK_similarity_matrix, 30)))
     protein_miRNA = dgl.bipartite_from_scipy(sparse.csr_matrix(protein_miRNA), 'protein', 'protein_miRNA', 'miRNA')
     miRNA_protein = dgl.bipartite_from_scipy(sparse.csr_matrix(miRNA_protein), 'miRNA', 'miRNA_protein', 'protein')
 
-    num_lncRNA = lncRNA_protein_interaction_matrix.shape[0]
-    num_protein = protein_miRNA_interaction_matrix.shape[0]
-    num_miRNA = protein_miRNA_interaction_matrix.shape[1]
+
 
     lncRNA_heterograph = dgl.heterograph({
         ('lncRNA', 'lncRNA_GK_similarity', 'lncRNA'): lncRNA_gk.edges(),
@@ -76,6 +78,7 @@ def create_heterograph(network_path,lncRNA_protein_interaction_matrix,lncRNA_miR
 
     protein_heterograph = dgl.heterograph({
         ('protein', 'protein_GO_similarity', 'protein'): protein_go.edges(),
+        ('protein','protein_GK_similarity', 'protein'): protein_gk.edges(),
         ('protein', 'protein_miRNA', 'miRNA'): protein_miRNA.edges(),
 
         ('miRNA', 'miRNA_protein', 'protein'): miRNA_protein.edges(),
@@ -93,7 +96,6 @@ def create_heterograph(network_path,lncRNA_protein_interaction_matrix,lncRNA_miR
     }).to("cuda:0")
     graph = [lncRNA_heterograph, protein_heterograph, miRNA_heterograph]
 
-    node_num = [num_lncRNA, num_protein, num_miRNA]
 
     all_meta_paths = [[
         ['lncRNA_GK_similarity'],
@@ -102,6 +104,7 @@ def create_heterograph(network_path,lncRNA_protein_interaction_matrix,lncRNA_miR
     ],
         [
             ['protein_GO_similarity'],
+            # ['protein_GK_similarity'],
             ['protein_miRNA', 'miRNA_protein'],
             ['protein_lncRNA', 'lncRNA_protein'],
         ],
@@ -112,7 +115,7 @@ def create_heterograph(network_path,lncRNA_protein_interaction_matrix,lncRNA_miR
         ],
     ]
 
-    return graph, node_num, all_meta_paths
+    return graph, all_meta_paths
 
 
 def load_interaction_matrix(network_path):
@@ -136,12 +139,12 @@ def load_features(data_path):
 
 def load_dataset(network_path,negative_sample_multiplier, threshold):
     lncRNA_protein_matrix, lncRNA_miRNA_matrix, protein_miRNA_matrix = load_interaction_matrix(network_path)
-    print(lncRNA_protein_matrix.shape)
-    print(lncRNA_miRNA_matrix.shape)
-    print(protein_miRNA_matrix.shape)
-    print("lncRNA-protein:" + str(len(np.where(lncRNA_protein_matrix == 1)[0])))
-    print("lncRNA-miRNA:" + str(len(np.where(lncRNA_miRNA_matrix == 1)[0])))
-    print("protein-miRNA:" + str(len(np.where(protein_miRNA_matrix == 1)[0])))
+    print("lncRNA-protein shape: "+str(lncRNA_protein_matrix.shape))
+    print("lncRNA-miRNA shape: "+str(lncRNA_miRNA_matrix.shape))
+    print("protein-miRNA shape: "+str(protein_miRNA_matrix.shape))
+    print("lncRNA-protein pair nums: " + str(len(np.where(lncRNA_protein_matrix == 1)[0])))
+    print("lncRNA-miRNA pair nums: " + str(len(np.where(lncRNA_miRNA_matrix == 1)[0])))
+    print("protein-miRNA pair nums: " + str(len(np.where(protein_miRNA_matrix == 1)[0])))
 
     positive_samples = []
     negative_samples = []
@@ -162,9 +165,7 @@ def load_dataset(network_path,negative_sample_multiplier, threshold):
             if value != 1:
                 negative_samples.append([i, j, value])
 
-    print("common miRNA:"+str(num))
-    print("positive samples:"+str(len(positive_samples)))
-    print("negative samples:"+str(len(negative_samples)))
+
 
     num_positive_samples = len(positive_samples)
     num_negative_samples_to_sample = num_positive_samples * negative_sample_multiplier
@@ -175,6 +176,9 @@ def load_dataset(network_path,negative_sample_multiplier, threshold):
     random.shuffle(final_dataset)
     final_dataset = np.array(final_dataset)
 
+    print("common miRNA nums: "+str(num))
+    print("positive samples nums: "+str(len(positive_samples)))
+    print("negative samples nums: "+str(len(random_negative_samples)))
 
     return final_dataset,lncRNA_protein_matrix,lncRNA_miRNA_matrix,protein_miRNA_matrix
 
@@ -247,9 +251,6 @@ def neighborhood(mat, k):
     return C
 
 
-
-
-
 def mask_node_features(features: torch.Tensor, noise_level: float = 0.1) -> torch.Tensor:
     num_nodes, num_features = features.shape
     mask = np.random.binomial(1, noise_level, (num_nodes, num_features))
@@ -301,6 +302,43 @@ def filter_interactions(lncRNA_miRNA_matrix, protein_miRNA_matrix, threshold=5):
     return final_lncRNA_miRNA, final_protein_miRNA
 
 
+def edge_list_to_adjacency_matrix(edge_list, num_nodes):
+    adjacency_matrix = np.zeros((num_nodes[0], num_nodes[1]))
 
+    for src, dst,label in edge_list:
+        if label == 1:
+            adjacency_matrix[src, dst] = 1
+
+    return adjacency_matrix
+
+
+
+import numpy as np
+
+
+def build_hypergraph(lncRNA_miRNA_interaction_matrix, protein_miRNA_interaction_matrix):
+
+
+    num_lncRNA = lncRNA_miRNA_interaction_matrix.shape[0]
+    num_protein = protein_miRNA_interaction_matrix.shape[0]
+    num_miRNA = lncRNA_miRNA_interaction_matrix.shape[1]
+
+    hypergraph1 = [[] for _ in range(num_miRNA)]
+    hypergraph2 = [[] for _ in range(num_miRNA)]
+
+    for lncRNA_index in range(num_lncRNA):
+        for miRNA_index in range(num_miRNA):
+            if lncRNA_miRNA_interaction_matrix[lncRNA_index, miRNA_index] > 0:
+                hypergraph1[miRNA_index].append(lncRNA_index)
+
+    for protein_index in range(num_protein):
+        for miRNA_index in range(num_miRNA):
+            if protein_miRNA_interaction_matrix[protein_index, miRNA_index] > 0:
+                hypergraph2[miRNA_index].append(protein_index)
+
+    hypergraph1 = [edge for edge in hypergraph1 if len(edge) >= 2]
+    hypergraph2 = [edge for edge in hypergraph2 if len(edge) >= 2]
+
+    return hypergraph1, hypergraph2
 
 

@@ -12,13 +12,13 @@ args = {}
 
 hidden_size = 512
 out_size = 64
-dropout = 0.9
-lr = 0.003
+dropout = 0.8
+lr = 0.001
 
 weight_decay = 1e-6
-epochs = 1200
+epochs = 300
 
-reg_loss_co = 0.0001
+reg_loss_co = 0.001
 fold = 0
 
 T = 2.0
@@ -27,8 +27,9 @@ num_tasks = 4
 L_t = torch.zeros(num_tasks)
 L_t_minus_1 = torch.ones(num_tasks)
 
+graph = []
 
-def main(tr, te, lncRNA_miRNA_matrix,protein_miRNA_matrix):
+def main(tr, te, lncRNA_miRNA_matrix_numpy,protein_miRNA_matrix_numpy,threshold,negative_ratio):
     all_metrics = {
         'acc': [],
         'pre': [],
@@ -38,12 +39,24 @@ def main(tr, te, lncRNA_miRNA_matrix,protein_miRNA_matrix):
         'recall': []
     }
 
+    global graph
 
 
     for i in range(len(tr)):
         train_index = tr[i]
         test_index = te[i]
 
+
+        graph, all_meta_paths = create_heterograph(data_dir, lncRNA_protein_matrix, lncRNA_miRNA_matrix_numpy,
+                                                   protein_miRNA_matrix_numpy)
+
+        l_edge_list,p_edge_list = build_hypergraph(lncRNA_miRNA_matrix_numpy,protein_miRNA_matrix_numpy)
+
+        lncRNA_miRNA_matrix = torch.from_numpy(lncRNA_miRNA_matrix_numpy).float().to(args['device'])
+        protein_miRNA_matrix = torch.from_numpy(protein_miRNA_matrix_numpy).float().to(args['device'])
+
+        l_hpGraph = Hypergraph(lncRNA_features.shape[0], l_edge_list).to(args['device'])
+        p_hpGraph = Hypergraph(protein_features.shape[0], p_edge_list).to(args['device'])
         model = ICMFLPI(
             all_meta_paths=all_meta_paths,
             in_size=[lncRNA_features.shape[1], protein_features.shape[1], miRNA_features.shape[1]],
@@ -55,6 +68,8 @@ def main(tr, te, lncRNA_miRNA_matrix,protein_miRNA_matrix):
             mask_mi=mask_mi,
             rna_mi=lncRNA_miRNA_matrix,
             pro_mi=protein_miRNA_matrix,
+            l_hpGraph=l_hpGraph,
+            p_hpGraph=p_hpGraph,
         ).to(args['device'])
         # model.load_state_dict(torch.load(f"{dir}/net{i}.pth"))
         optim = torch.optim.AdamW(lr=lr, weight_decay=weight_decay, params=model.parameters())
@@ -78,13 +93,10 @@ def main(tr, te, lncRNA_miRNA_matrix,protein_miRNA_matrix):
         }
 
         for epoch in tqdm(range(epochs)):
-            out2, lncRNA_h, protein_h, miRNA_h, rna_embs, protein_embs, miRNA_embs = train(model, optim, train_index)
-            model.eval()
+            out = train(model, optim, train_index)
 
-            out = model(graph, node_feature, test_index, data, iftrain=False, lncRNA_h=lncRNA_h,
-                        protein_h=protein_h,
-                        miRNA_h=miRNA_h,
-                        rna_embs=rna_embs, protein_embs=protein_embs, miRNA_embs=miRNA_embs)
+
+            out = test(model, test_index)
 
             auroc, aupr, acc, f1, pre, recall,tpr,fpr = metric(out, label[test_index])
 
@@ -95,7 +107,7 @@ def main(tr, te, lncRNA_miRNA_matrix,protein_miRNA_matrix):
             mc['precision'].append(pre)
             mc['recall'].append(recall)
 
-            if epoch / epochs > 0.7:
+            if epoch / epochs > 0.9:
                 if auroc > best_auroc:
                     best_auroc = auroc
                 if aupr > best_aupr:
@@ -109,7 +121,12 @@ def main(tr, te, lncRNA_miRNA_matrix,protein_miRNA_matrix):
                 if recall > best_recall:
                     best_recall = recall
 
+            # print('AUROC= %.4f | AUPR= %.4f | ACC= %.4f | F1_score= %.4f | precision= %.4f | recall= %.4f' % (
+            #     auroc, aupr, acc, f1, pre, recall))
+            #
 
+
+        # auroc, aupr, acc, f1, pre, recall,tpr,fpr = metric(out, label[test_index])
         all_metrics['acc'].append(best_acc)
         all_metrics['pre'].append(best_precision)
         all_metrics['roc'].append(best_auroc)
@@ -128,11 +145,20 @@ def main(tr, te, lncRNA_miRNA_matrix,protein_miRNA_matrix):
     pre = np.mean(all_metrics['pre'])
     recall = np.mean(all_metrics['recall'])
 
-
-
     print('AUROC= %.4f | AUPR= %.4f | ACC= %.4f | F1_score= %.4f | precision= %.4f | recall= %.4f' % (
         roc, aupr, acc, f1, pre, recall))
 
+def test(model, test_index):
+
+    global L_t, L_t_minus_1
+    model.eval()
+    out, rna_cross_loss, pro_cross_loss, mi_cross_loss, lncRNA_h, protein_h, miRNA_h, rna_embs, protein_embs, miRNA_embs = model(
+        graph,
+        node_feature,
+        test_index,
+        data)
+
+    return out
 
 def train(model, optim, train_index):
     global L_t, L_t_minus_1
@@ -169,19 +195,20 @@ def train(model, optim, train_index):
     L_t_minus_1 = L_t.clone()
 
     loss = loss + reg_loss_co * reg
+    # print("train loss: ", loss.item() )
     optim.zero_grad()
     loss.backward()
     optim.step()
 
 
-    return out, lncRNA_h, protein_h, miRNA_h, rna_embs, protein_embs, miRNA_embs
+    return out
 
 
 data_dir = "data1/"
 args['device'] = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-nsm = [1,3,5,7]
-thresholds = [3,5,7,9]
+nsm = [3]
+thresholds = [3]
 for threshold in thresholds:
     for negative_sample_multiplier in nsm:
 
@@ -191,36 +218,36 @@ for threshold in thresholds:
 
         lncRNA_miRNA_matrix, protein_miRNA_matrix = filter_interactions(lncRNA_miRNA_matrix, protein_miRNA_matrix, threshold)
         lncRNA_miRNA_matrix = remove_half_interactions(lncRNA_miRNA_matrix,0.8)
-        print(len(np.nonzero(lncRNA_miRNA_matrix)[0]))
-        print(len(np.nonzero(protein_miRNA_matrix)[0]))
-        print(len(np.nonzero(lncRNA_protein_matrix)[0]))
 
-        graph, num, all_meta_paths = create_heterograph(data_dir, lncRNA_protein_matrix, lncRNA_miRNA_matrix,
-                                                        protein_miRNA_matrix)
 
-        lncRNA_miRNA_matrix = torch.from_numpy(lncRNA_miRNA_matrix).float().to(args['device'])
-        protein_miRNA_matrix = torch.from_numpy(protein_miRNA_matrix).float().to(args['device'])
+        lncRNA_features = torch.randn(lncRNA_protein_matrix.shape[0], 180).to(args['device'])
+        protein_features = torch.randn(lncRNA_protein_matrix.shape[1], 180).to(args['device'])
+        miRNA_features = torch.randn(lncRNA_miRNA_matrix.shape[1], 180).to(args['device'])
+
+        node_feature = [lncRNA_features, protein_features, miRNA_features]
+
+
 
         lncRNA_GK_similarity_matrix = np.loadtxt(data_dir + 'lncRNA_GK_similarity_matrix.txt')
         miRNA_GK_similarity_matrix = np.loadtxt(data_dir + 'miRNA_GK_similarity_matrix.txt')
-        #
         protein_GO_similarity_matrix = np.loadtxt(data_dir + 'proteinGO.txt')
+        protein_GK_similarity_matrix = np.loadtxt(data_dir + 'protein_GK_similarity_matrix.txt')
 
         lnc_gk = neighborhood(lncRNA_GK_similarity_matrix, 20)
         pro_go = neighborhood(protein_GO_similarity_matrix, 10)
+        pro_gk = neighborhood(protein_GK_similarity_matrix, 10)
         mi_gk = neighborhood(miRNA_GK_similarity_matrix, 30)
-        mask_pro = torch.from_numpy(pro_go).to(args['device'])
+
+
+        mask_pro_go = torch.from_numpy(pro_go).to(args['device'])
+        # maks_pro_gk = torch.from_numpy(pro_gk).to(args['device'])
+        # mask_pro = torch.logical_or(mask_pro_go,maks_pro_gk)
+
+        mask_pro = mask_pro_go
         mask_rna = torch.from_numpy(lnc_gk).to(args['device'])
         mask_mi = torch.from_numpy(mi_gk).to(args['device'])
 
         lncRNA_protein_label = torch.tensor(lncRNA_protein_dataset[:, 2:3]).to(args['device'])
-
-
-        lncRNA_features = torch.randn(num[0], 180).to(args['device'])
-        protein_features = torch.randn(num[1], 180).to(args['device'])
-        miRNA_features = torch.randn(num[2], 180).to(args['device'])
-
-        node_feature = [lncRNA_features, protein_features, miRNA_features]
 
         data = lncRNA_protein_dataset
 
@@ -228,5 +255,5 @@ for threshold in thresholds:
 
         train_indeces, test_indeces = get_cross(lncRNA_protein_dataset)
 
-        main(train_indeces, test_indeces,lncRNA_miRNA_matrix,protein_miRNA_matrix)
+        main(train_indeces, test_indeces,lncRNA_miRNA_matrix,protein_miRNA_matrix,threshold,negative_sample_multiplier)
 
