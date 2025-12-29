@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
-import dgl
-import dhg
-import scipy
-from dgl.nn.pytorch import GraphConv, GATConv
+
+from dgl.nn.pytorch import GraphConv
 
 
 from Layer import *
